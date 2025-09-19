@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import sys
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import NamedTuple, Any, Optional
 from types import ModuleType
 from gi.repository import GLib, Gio  # type: ignore
@@ -153,6 +154,63 @@ def translate_properties(variant):
     return {
         key: translate_property(key, value) for key, value in variant.items()
     }
+
+
+def properties_to_json(properties):
+    """Convert properties dictionary to JSON-serializable format."""
+    json_properties = {}
+    for key, value in properties.items():
+        if isinstance(value, list):
+            json_properties[key] = [str(item) for item in value]
+        elif hasattr(value, '__str__') and hasattr(value, 'name'):  # Enum-like objects
+            json_properties[key] = str(value)
+        else:
+            json_properties[key] = value
+    return json_properties
+
+
+def to_json_dict(obj, exclude_none=True, **kwargs):
+    """
+    Convert dataclass to JSON-serializable dictionary with smart handling.
+    
+    Args:
+        obj: The dataclass instance
+        exclude_none: Whether to exclude None values
+        **kwargs: Additional processing options
+    """
+    if hasattr(obj, '__dataclass_fields__'):
+        # Use dataclasses.asdict for automatic conversion
+        result = asdict(obj)
+    else:
+        # Fallback for non-dataclass objects
+        result = obj.__dict__.copy()
+    
+    def process_value(value):
+        if value is None:
+            return None
+        elif isinstance(value, list):
+            return [process_value(item) for item in value]
+        elif isinstance(value, dict):
+            if value and any(hasattr(v, '__str__') and hasattr(v, 'name') for v in value.values()):
+                # This looks like a properties dict with enums
+                return properties_to_json(value)
+            return {k: process_value(v) for k, v in value.items()}
+        elif hasattr(value, '__str__') and hasattr(value, 'name'):  # Enum-like objects
+            return str(value)
+        elif hasattr(value, '_asdict'):  # NamedTuple
+            return value._asdict()
+        elif hasattr(value, '__dataclass_fields__'):  # Nested dataclass
+            return to_json_dict(value, exclude_none=exclude_none)
+        else:
+            return value
+    
+    processed = {}
+    for key, value in result.items():
+        processed_value = process_value(value)
+        if not exclude_none or processed_value is not None:
+            processed[key] = processed_value
+    
+    return processed
 
 
 def print_data(*, level: int, is_last: bool, lines: list[int], data: str):
@@ -401,6 +459,9 @@ class MonitorMode:
             properties=translate_properties(variant[6]),
         )
 
+    def to_dict(self) -> dict:
+        return to_json_dict(self)
+
 
 @dataclass
 class Monitor:
@@ -459,6 +520,16 @@ class Monitor:
             rgb_range=rgb_range,
         )
 
+    def to_dict(self, show_modes: bool = False, show_properties: bool = False) -> dict:
+        """Convert Monitor to JSON-serializable dictionary."""
+        result = to_json_dict(self, exclude_none=False)
+        if not show_modes:
+            result.pop('modes', None)
+        if not show_properties:
+            result.pop('properties', None)
+
+        return result
+
 
 @dataclass
 class LogicalMonitor:
@@ -472,7 +543,7 @@ class LogicalMonitor:
 
     @classmethod
     def from_variant(cls, monitors_state, variant):
-        position = (variant[0], variant[1])
+        position = Position(variant[0], variant[1])
         scale = variant[2]
         transform = Transform(variant[3])
         is_primary = variant[4]
@@ -490,6 +561,19 @@ class LogicalMonitor:
             is_primary=is_primary,
             properties=properties,
         )
+
+    def to_dict(self, show_modes: bool = False, show_properties: bool = False) -> dict:
+        result = to_json_dict(self, exclude_none=False)
+        result["monitors"] = [
+            {
+                "connector": monitor.connector,
+                "display_name": monitor.display_name
+            } for monitor in self.monitors
+        ]
+        result.pop('args', None)
+        if not show_properties:
+            result.pop('properties', None)
+        return result
 
     def calculate_size(self, layout_mode):
         mode = next(monitor.mode for monitor in self.monitors)
@@ -1084,7 +1168,27 @@ class MonitorsState:
             mode_properties = mode.properties
             print_properties(level=3, lines=lines, properties=mode_properties)
 
-    def print_current_state(self, show_modes=False, show_properties=False):
+    def print_current_state(self, show_modes=False, show_properties=False, format_json=False):
+        if format_json:
+            try:
+                data = {
+                    "monitors": [
+                        monitor.to_dict(show_modes, show_properties)
+                        for monitor in self.monitors.values()
+                    ],
+                    "logical_monitors": [
+                        logical_monitor.to_dict(show_modes, show_properties)
+                        for logical_monitor in self.logical_monitors
+                    ]
+                }
+                if show_properties:
+                    data["properties"] = properties_to_json(self.properties)
+                print(json.dumps(data, indent=2, ensure_ascii=False))
+            except (TypeError, ValueError) as e:
+                print(f"Error serializing to JSON: {e}", file=sys.stderr)
+                sys.exit(1)
+            return
+
         print("Monitors:")
         lines = []
         monitors = list(self.monitors.values())
@@ -1488,6 +1592,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Display all available information",
     )
+    show_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
     set_parser = subparser.add_parser(
         "set",
         help="Set display configuration",
@@ -1715,6 +1824,7 @@ if __name__ == "__main__":
             monitors_state.print_current_state(
                 show_modes=show_modes,
                 show_properties=show_properties,
+                format_json=args.json,
             )
         case "set":
             try:
